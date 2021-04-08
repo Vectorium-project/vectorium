@@ -24,6 +24,7 @@
 #include "primitives/transaction.h"
 #include "zcbenchmarks.h"
 #include "script/interpreter.h"
+#include "script/sign.h"
 #include "zcash/Address.hpp"
 
 #include "utiltime.h"
@@ -35,6 +36,7 @@
 #include "wallet/asyncrpcoperation_shieldcoinbase.h"
 
 #include <stdint.h>
+#include <iomanip>
 
 #include <boost/assign/list_of.hpp>
 #include <utf8.h>
@@ -4306,6 +4308,258 @@ UniValue z_sendmany(const UniValue& params, bool fHelp)
     return operationId;
 }
 
+UniValue kv_set(const UniValue& params, bool fHelp)
+{
+    if (!EnsureWalletIsAvailable(fHelp))
+        return NullUniValue;
+
+    if (fHelp || params.size() < 2 || params.size() > 3)
+        throw runtime_error(
+            "kv_set \"fromaddress\" '[{\"key\":... ,\"value\":...},...]' (\"toaddress\")\n"
+            "\nSet key/value pair(s). Both key and value are UTF-8 encoded strings."
+            "\nChange generated flows back to a fromaddress."
+            "\nThe maximum key/value data per operation is limited by 1024 bytes for nulldata output, exact number of characters may be less because of the UTF-8 encoding."
+            + HelpRequiringPassphrase() + "\n"
+            "\nArguments:\n"
+            "1. \"fromaddress\"         (string, required) The V2 address to pay for key/value pair registration from.\n"
+            "2. \"key/value pairs\"     (array, required) An array of json objects representing the key/value pairs to register.\n"
+            "    [{\n"
+            "      \"key\":key          (string, required) The key\n"
+            "      \"value\":value      (string, required) The value\n"
+            "    }, ... ]\n"
+            "3. \"toaddress\"           (string, optional) The V2 address destination for key/value pair registration, if not set in .conf file with kvdestination=toaddress \n"
+            "\nResult:\n"
+            "\"txid\"                   (string) An txid of a transaction that contains key/value pair registration.\n"
+            "\nExamples:\n"
+            + HelpExampleCli("kv_set", "\"V2m72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\" '[{\"key\": \"nick\" ,\"value\": \"Vectoshi\"}]'")
+            + HelpExampleRpc("kv_set", "\"V2m72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\", '[{\"key\": \"nick\" ,\"value\": \"Vectoshi\"}]'")
+        );
+    
+    if (params.size() < 3 && GetArg("-kvdestination", "") == "")
+    {
+        throw runtime_error("kvdestination address has to be set either via .conf file or as third parameter of kv_set RPC command!\n");
+    }
+
+
+
+    LOCK2(cs_main, pwalletMain->cs_wallet);
+
+    ThrowIfInitialBlockDownload();
+
+    // Check that the from address is valid.
+    auto fromaddress = params[0].get_str();
+    bool fromTaddr = false;
+
+    KeyIO keyIO(Params());
+    CTxDestination taddr = keyIO.DecodeDestination(fromaddress);
+    fromTaddr = IsValidDestination(taddr);
+    if (!fromTaddr) {
+        // invalid
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid from address, should be a valid V2 addr.");
+    }
+
+    // Check that the destination address is valid
+    auto toaddress = (params.size() == 3) ? params[2].get_str() : GetArg("-kvdestination", "");
+    bool toTaddr = false;
+
+    CTxDestination destaddr = keyIO.DecodeDestination(toaddress);
+    toTaddr = IsValidDestination(destaddr);
+    if (!toTaddr) {
+        // invalid to address
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination address, should be a valid V2 addr.");
+    }
+
+    UniValue uv_kv_array = params[1].get_array();
+
+    if (uv_kv_array.size()==0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, key/value array is empty.");
+
+
+    UniValue ret(UniValue::VOBJ);
+
+    for (const UniValue& uv_kv_object : uv_kv_array.getValues()) {
+        if (!uv_kv_object.isObject())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected object");
+
+        // sanity check, report error if unknown key-value pairs
+        for (const string& name_ : uv_kv_object.getKeys()) {
+            std::string s = name_;
+            if (s != "key" && s != "value")
+                throw JSONRPCError(RPC_INVALID_PARAMETER, string("Invalid parameter, unknown property: \"")+s+"\"");
+        }
+
+        string key = find_value(uv_kv_object, "key").get_str();
+        string value = find_value(uv_kv_object, "value").get_str();
+
+        ret.pushKV(key, value);
+        
+
+    }
+
+    if (ret.size() < uv_kv_array.size())
+    {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, string("Invalid parameter, duplicate key(s) found"));
+    }
+
+    string s = ret.write();
+
+    ret.pushKV("asString", s);
+    ret.pushKV("string_size", s.size());
+
+    UniValue uv(UniValue::VOBJ);
+    uv.read(s);
+
+    ret.pushKV("reconverted", uv);
+
+    std::vector<uint8_t> v;
+    std::copy(s.begin(), s.end(), std::back_inserter(v));
+
+    ret.pushKV("vector", v.data());
+
+    std::string str(v.begin(), v.end());
+    ret.pushKV("string_from_vector", str);
+    ret.pushKV("vector_size", v.size());
+
+    CScript script;
+    script.clear();
+    script = CScript() << OP_RETURN << ParseHex(s);
+
+    CAmount KV_FEE = 10 * DEFAULT_MIN_RELAY_TX_FEE;
+    CAmount sum_utxos = 0;
+    vector<COutput> v_utxos, v_funding_utxos;
+    
+    
+    pwalletMain->AvailableCoins(v_utxos, false, NULL, true);
+    
+    int ui = 0;
+    BOOST_FOREACH(const COutput& out, v_utxos)
+    {
+        CTxDestination address;
+        const CScript& scriptPubKey = out.tx->vout[out.i].scriptPubKey;
+        bool fValidAddress = ExtractDestination(scriptPubKey, address);
+
+        if (!fValidAddress || out.tx->IsCoinBase() || !out.fSpendable || (keyIO.EncodeDestination(address) != fromaddress))
+            continue;
+
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("txid", out.tx->GetHash().GetHex());
+        entry.pushKV("vout", out.i);
+  
+        if (fValidAddress) {
+            entry.pushKV("address", keyIO.EncodeDestination(address));
+
+            if (pwalletMain->mapAddressBook.count(address))
+                entry.pushKV("account", pwalletMain->mapAddressBook[address].name);
+
+            if (scriptPubKey.IsPayToScriptHash()) {
+                const CScriptID& hash = boost::get<CScriptID>(address);
+                CScript redeemScript;
+                if (pwalletMain->GetCScript(hash, redeemScript))
+                    entry.pushKV("redeemScript", HexStr(redeemScript.begin(), redeemScript.end()));
+            }
+        }
+
+        entry.pushKV("scriptPubKey", HexStr(scriptPubKey.begin(), scriptPubKey.end()));
+        entry.pushKV("amount", ValueFromAmount(out.tx->vout[out.i].nValue));
+        entry.pushKV("amountZat", out.tx->vout[out.i].nValue);
+        entry.pushKV("confirmations", out.nDepth);
+        entry.pushKV("spendable", out.fSpendable);
+        ret.pushKV(strprintf("utxo_%i", ui++), entry);
+
+
+
+        sum_utxos += out.tx->vout[out.i].nValue;
+        v_funding_utxos.push_back(out);
+
+        if (sum_utxos >= (1000 + KV_FEE))
+        {
+            // enough utxos
+            break;
+        }
+
+
+    }
+
+    if (v_funding_utxos.size() > 0 && sum_utxos >= (1000 + KV_FEE))
+    {
+        // we have utxo(s) to fund transaction
+        CAmount change = sum_utxos - 1000 - KV_FEE;
+        //CMutableTransaction mtx;        
+        CWalletTx wtxNew;
+        
+        wtxNew.fTimeReceivedIsTxTime = true;
+        wtxNew.BindWallet(pwalletMain);
+    
+        int nextBlockHeight = chainActive.Height() + 1;
+        CMutableTransaction mtx = CreateNewContextualCMutableTransaction(Params().GetConsensus(), nextBlockHeight);
+
+        mtx.nLockTime = std::max(0, chainActive.Height() - 10);
+
+        // add vin(s)
+        for (COutput one_utxo: v_funding_utxos)
+        {
+            mtx.vin.push_back(CTxIn(one_utxo.tx->GetHash(), one_utxo.i, CScript(), std::numeric_limits<unsigned int>::max() - 1));
+        }
+
+        // add regular vout
+        //CTxDestination to_address_destination = keyIO.DecodeDestination("V2Fwzs647s2WqfwM1YmYetHbbdYD7HfTB3s");
+        CScript script_destination = GetScriptForDestination(destaddr);
+        mtx.vout.push_back(CTxOut(1000, script_destination));
+
+        // add nulldata vout
+        CScript script_nulldata = CScript() << OP_RETURN << v;
+        mtx.vout.push_back(CTxOut(0, script_nulldata));
+
+        if (change > DEFAULT_MIN_RELAY_TX_FEE)
+        {
+            // add change vout
+            CScript script_change = GetScriptForDestination(taddr);
+            mtx.vout.push_back(CTxOut(change, script_change));
+        }
+
+        auto consensusBranchId = CurrentEpochBranchId(chainActive.Height() + 1, Params().GetConsensus());
+
+        // Sign
+        int nIn = 0;
+        CTransaction txNewConst(mtx);
+        for (COutput one_utxo: v_funding_utxos)
+        {
+            bool signSuccess;
+            const CScript& scriptPubKey = one_utxo.tx->vout[one_utxo.i].scriptPubKey;
+            SignatureData sigdata;
+            signSuccess = ProduceSignature(TransactionSignatureCreator(pwalletMain, &txNewConst, nIn, one_utxo.tx->vout[one_utxo.i].nValue, SIGHASH_ALL), scriptPubKey, sigdata, consensusBranchId);
+
+            if (signSuccess)
+            {
+                UpdateTransaction(mtx, nIn, sigdata);
+            }
+
+            nIn++;
+        }
+
+        // Embed the constructed transaction data in wtxNew.
+        *static_cast<CTransaction*>(&wtxNew) = CTransaction(mtx);
+
+        pwalletMain->CommitTransaction(wtxNew, boost::none);
+
+        ret.pushKV("WTX", EncodeHexTx(wtxNew));
+        
+
+        
+        
+
+
+
+
+
+
+    }
+
+
+    return ret;
+
+}
+
 UniValue z_setmigration(const UniValue& params, bool fHelp) {
     if (!EnsureWalletIsAvailable(fHelp))
         return NullUniValue;
@@ -5271,6 +5525,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "z_importwallet",           &z_importwallet,           true  },
     { "wallet",             "z_viewtransaction",        &z_viewtransaction,        false },
     { "wallet",             "z_getnotescount",          &z_getnotescount,          false },
+    { "key-value",          "kv_set",                   &kv_set,                   false },
     // TODO: rearrange into another category
     { "disclosure",         "z_getpaymentdisclosure",   &z_getpaymentdisclosure,   true  },
     { "disclosure",         "z_validatepaymentdisclosure", &z_validatepaymentdisclosure, true }

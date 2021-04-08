@@ -226,6 +226,10 @@ std::string LogConfigFilter()
     // With no -debug flags, show errors and LogPrintf lines.
     std::string filter = "error,main=info";
 
+    // legacy setting debug=0 for no debug compatibility
+    if (GetArg("-debug", "0") == "0")
+        return filter;
+
     auto& categories = mapMultiArgs["-debug"];
     std::set<std::string> setCategories(categories.begin(), categories.end());
     if (setCategories.count(string("")) != 0 || setCategories.count(string("1")) != 0) {
@@ -579,7 +583,8 @@ void ReadConfigFile(const std::string& confPath,
         "seednode",
         "uacomment",
         "whitebind",
-        "whitelist"
+        "whitelist",
+        "scankvdest"
     };
     set<string> unique_options;
 

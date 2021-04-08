@@ -21,6 +21,7 @@
 #include "deprecation.h"
 #include "experimental_features.h"
 #include "init.h"
+#include "kvmanager.h"
 #include "key_io.h"
 #include "merkleblock.h"
 #include "metrics.h"
@@ -2833,6 +2834,35 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             if (!view.HaveShieldedRequirements(tx))
                 return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),
                                  REJECT_INVALID, "bad-txns-joinsplit-requirements-not-met");
+
+            // here would be a good anchor point for scanning tx for kv records
+
+            LogPrintf("KV SCAN\n");
+            std::vector<std::string> vScanKVDest = mapMultiArgs["-scankvdest"];
+            if (vScanKVDest.size())
+            {
+                UniValue uv_kvdests(UniValue::VARR);
+                KeyIO keyIO(Params());
+                for (std::string destaddr: vScanKVDest)
+                {
+                    uv_kvdests.push_back(destaddr);
+                    CTxDestination dest = keyIO.DecodeDestination(destaddr);
+                    if (IsValidDestination(dest))
+                    {
+                        CKeyID keyID = boost::get<CKeyID>(dest);
+                        LogPrintf("TYPE of %s is %s and IsNull = %s\n", destaddr, keyID.ToString(), keyID.IsNull() ? "TRUE" : "FALSE");
+                    }
+                    else
+                    {
+                        LogPrintf("INVALID DESTINATION %s\n", destaddr);
+                    }
+                     
+
+                }
+                LogPrintf("-scankvdest: %s\n", uv_kvdests.write());
+            }
+            
+            
 
             // insightexplorer
             // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2597
